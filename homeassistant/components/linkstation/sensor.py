@@ -4,13 +4,19 @@ from __future__ import annotations
 from datetime import timedelta
 import logging
 import sys
+from typing import Any
 
 from linkstation import LinkStation
 import voluptuous as vol
 
 from homeassistant.components.linkstation.const import (
+    ATTR_DISK_CAPACITY,
+    ATTR_DISK_UNIT_NAME,
+    ATTR_DISK_USED,
     DEFAULT_NAME,
     DEFAULT_UPDATE_INTERVAL,
+    LINKSTATION_DISK_STATUS_NORMAL,
+    LINKSTATION_STATUS_ATTR_NAME,
 )
 from homeassistant.components.sensor import (
     PLATFORM_SCHEMA,
@@ -37,30 +43,18 @@ _THROTTLED_REFRESH = None
 
 SENSOR_TYPES: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
-        key="current_status",
-        name="Status",
-    ),
-    SensorEntityDescription(
-        key="disk_capacity",
-        name="Disk Capacity",
-        native_unit_of_measurement=DATA_GIGABYTES,
-        state_class=STATE_CLASS_MEASUREMENT,
-    ),
-    SensorEntityDescription(
-        key="disk_used",
-        name="Disk Used",
-        native_unit_of_measurement=DATA_GIGABYTES,
-        state_class=STATE_CLASS_MEASUREMENT,
+        key=LINKSTATION_STATUS_ATTR_NAME,
+        name="status",
     ),
     SensorEntityDescription(
         key="disk_free",
-        name="Disk Space Free",
+        name="available",
         native_unit_of_measurement=DATA_GIGABYTES,
         state_class=STATE_CLASS_MEASUREMENT,
     ),
     SensorEntityDescription(
         key="disk_used_pct",
-        name="Disk Used Pct",
+        name="used (%)",
         native_unit_of_measurement=PERCENTAGE,
         state_class=STATE_CLASS_MEASUREMENT,
     ),
@@ -86,21 +80,32 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_setup_platform(hass, config, add_entities, discovery_info=None):
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the Linkstation sensors."""
     name = config[CONF_NAME]
     host = config[CONF_HOST]
     username = config[CONF_USERNAME]
     password = config[CONF_PASSWORD]
-    # disks = config[CONF_DISKS]
+    disks = config[CONF_DISKS]
 
     linkstation_api = LinkStation(username, password, host)
-    try:
-        await linkstation_api.get_disks_info()
-        disks = await linkstation_api.get_active_disks()
-    except Exception:
-        _LOGGER.error("Connection to LinkStation failed")
-        raise PlatformNotReady
+
+    if not disks:
+        _LOGGER.debug("No disks configuration, getting all disks from server.")
+        try:
+            # name = await linkstation_api.get_linkstation_name_async()
+            disks = await linkstation_api.get_all_disks_async()
+        except Exception:
+            _LOGGER.error("Connection to LinkStation failed")
+            raise PlatformNotReady
+
+    # if name == DEFAULT_NAME:
+    #     _LOGGER.debug("No LinkStation Name configuration, gettine name from server.")
+    #     try:
+    #         name = await linkstation_api.get_linkstation_name_async()
+    #     except Exception:
+    #         _LOGGER.error("Connection to LinkStation failed")
+    #         raise PlatformNotReady
 
     monitored_variables = config[CONF_MONITORED_VARIABLES]
     entities = []
@@ -111,7 +116,8 @@ async def async_setup_platform(hass, config, add_entities, discovery_info=None):
                 entities.append(
                     LinkStationSensor(linkstation_api, name, description, disk)
                 )
-    add_entities(entities)
+
+    async_add_entities(entities)
 
 
 class LinkStationSensor(SensorEntity):
@@ -120,24 +126,26 @@ class LinkStationSensor(SensorEntity):
     def __init__(
         self,
         linkstation_client: LinkStation,
-        client_name,
+        linkstation_name,
         description: SensorEntityDescription,
-        disk: str,
+        disk_name: str,
     ):
         """Initialize the sensor."""
         self.entity_description = description
         self.client = linkstation_client
-        self.data = None
-        self.disk = disk
-
-        self._attr_available = False
-        self._attr_name = f"{client_name} {description.name} - {disk}"
-        # self._attr_should_poll = True
+        self.disk_status = None
+        self.disk = disk_name
+        self.disk_data = None
+        self._attr_name = f"{linkstation_name} {disk_name} {description.name}"
+        self._attrs: dict[str, Any] = {}
 
     async def async_update(self):
         """Get the latest data from LinkStation and updates the state."""
+        _LOGGER.debug("Update data for %s", self._attr_name)
+
         try:
-            self.data = await self.client.get_disk_status(self.disk)
+            self.disk_data = await self.client.get_disks_info_async()
+            self.disk_status = self.client.get_disk_status(self.disk)
             self._attr_available = True
         except Exception:
             _LOGGER.error("Connection to LinkStation Failed")
@@ -146,31 +154,47 @@ class LinkStationSensor(SensorEntity):
             return
 
         sensor_type = self.entity_description.key
-        if sensor_type == "current_status":
-            self._attr_native_value = self.data
+        if sensor_type == LINKSTATION_STATUS_ATTR_NAME:
+
+            if self.is_disk_ready():
+                self._attr_native_value = LINKSTATION_DISK_STATUS_NORMAL
+            else:
+                self._attr_native_value = self.disk_status
             self._attr_icon = "mdi:harddisk"
             return
 
-        if self.data and self.data.startswith("normal"):
-            if sensor_type == "disk_capacity":
-                self._attr_native_value = await self.client.get_disk_capacity(self.disk)
-                self._attr_icon = "mdi:folder-outline"
-
-            elif sensor_type == "disk_used":
-                self._attr_native_value = await self.client.get_disk_amount_used(
-                    self.disk
-                )
-                self._attr_icon = "mdi:folder-outline"
-
-            elif sensor_type == "disk_used_pct":
-                self._attr_native_value = await self.client.get_disk_pct_used(self.disk)
+        if self.is_disk_ready():
+            if sensor_type == "disk_used_pct":
+                self._attr_native_value = self.client.get_disk_pct_used(self.disk)
                 self._attr_icon = "mdi:gauge"
 
             elif sensor_type == "disk_free":
 
-                self._attr_native_value = await self.client.get_disk_capacity(
-                    self.disk
-                ) - await self.client.get_disk_amount_used(self.disk)
+                self._attr_native_value = self.client.get_disk_free(self.disk)
                 self._attr_icon = "mdi:folder-outline"
         else:
             self._attr_available = False
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the state attributes."""
+        if self.is_disk_ready():
+            self._attrs.update(
+                {
+                    ATTR_DISK_CAPACITY: self.client.get_disk_capacity(self.disk),
+                    ATTR_DISK_USED: self.client.get_disk_amount_used(self.disk),
+                    ATTR_DISK_UNIT_NAME: self.client.get_disk_unit_name(self.disk),
+                }
+            )
+
+        return self._attrs
+
+    def is_disk_ready(self) -> bool:
+        """Check if disk status is normal."""
+        if self.disk_status is not None and (
+            self.disk_status.startswith(LINKSTATION_DISK_STATUS_NORMAL)
+            or self.disk_status == ""
+        ):
+            return True
+        else:
+            return False
