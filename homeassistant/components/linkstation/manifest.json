@@ -2,7 +2,7 @@
     "domain": "linkstation",
     "name": "LinkStation",
     "documentation": "https://github.com/iKaew/linkstation",
-    "requirements": ["linkstation==0.0.6", "expiringdict==1.2.1"],
+    "requirements": ["linkstation==0.0.7", "expiringdict==1.2.1"],
     "codeowners": ["@ikaew"],
     "iot_class": "local_polling"
   }

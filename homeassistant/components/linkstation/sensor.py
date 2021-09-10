@@ -99,13 +99,13 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
             _LOGGER.error("Connection to LinkStation failed")
             raise PlatformNotReady
 
-    # if name == DEFAULT_NAME:
-    #     _LOGGER.debug("No LinkStation Name configuration, gettine name from server.")
-    #     try:
-    #         name = await linkstation_api.get_linkstation_name_async()
-    #     except Exception:
-    #         _LOGGER.error("Connection to LinkStation failed")
-    #         raise PlatformNotReady
+    if name == DEFAULT_NAME:
+        _LOGGER.debug("No LinkStation Name configuration, gettine name from server.")
+        try:
+            name = await linkstation_api.get_linkstation_name_async()
+        except Exception:
+            _LOGGER.error("Connection to LinkStation failed")
+            raise PlatformNotReady
 
     monitored_variables = config[CONF_MONITORED_VARIABLES]
     entities = []
