@@ -1,24 +1,27 @@
 """The tests for the logbook component."""
 # pylint: disable=protected-access,invalid-name
+import asyncio
 import collections
 from datetime import datetime, timedelta
+from http import HTTPStatus
 import json
 from unittest.mock import Mock, patch
 
 import pytest
 import voluptuous as vol
 
-from homeassistant.components import logbook, recorder
+from homeassistant.components import logbook
 from homeassistant.components.alexa.smart_home import EVENT_ALEXA_SMART_HOME
 from homeassistant.components.automation import EVENT_AUTOMATION_TRIGGERED
-from homeassistant.components.recorder.models import process_timestamp_to_utc_isoformat
 from homeassistant.components.script import EVENT_SCRIPT_STARTED
+from homeassistant.components.sensor import SensorStateClass
 from homeassistant.const import (
     ATTR_DOMAIN,
     ATTR_ENTITY_ID,
     ATTR_FRIENDLY_NAME,
     ATTR_NAME,
     ATTR_SERVICE,
+    ATTR_UNIT_OF_MEASUREMENT,
     CONF_DOMAINS,
     CONF_ENTITIES,
     CONF_EXCLUDE,
@@ -27,44 +30,45 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
-    EVENT_STATE_CHANGED,
     STATE_OFF,
     STATE_ON,
 )
 import homeassistant.core as ha
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entityfilter import CONF_ENTITY_GLOBS
 from homeassistant.helpers.json import JSONEncoder
-from homeassistant.setup import async_setup_component, setup_component
+from homeassistant.setup import async_setup_component
 import homeassistant.util.dt as dt_util
 
-from tests.common import get_test_home_assistant, init_recorder_component, mock_platform
-from tests.components.recorder.common import trigger_db_commit
+from .common import MockRow, mock_humanify
+
+from tests.common import async_capture_events, mock_platform
+from tests.components.recorder.common import (
+    async_recorder_block_till_done,
+    async_wait_recording_done,
+)
 
 EMPTY_CONFIG = logbook.CONFIG_SCHEMA({logbook.DOMAIN: {}})
 
 
 @pytest.fixture
-def hass_():
+async def hass_(hass, recorder_mock):
     """Set up things to be run when tests are started."""
-    hass = get_test_home_assistant()
-    init_recorder_component(hass)  # Force an in memory DB
-    with patch("homeassistant.components.http.start_http_server_and_save_config"):
-        assert setup_component(hass, logbook.DOMAIN, EMPTY_CONFIG)
-        yield hass
-    hass.stop()
+    assert await async_setup_component(hass, logbook.DOMAIN, EMPTY_CONFIG)
+    return hass
 
 
-def test_service_call_create_logbook_entry(hass_):
+@pytest.fixture()
+def set_utc(hass):
+    """Set timezone to UTC."""
+    hass.config.set_time_zone("UTC")
+
+
+async def test_service_call_create_logbook_entry(hass_):
     """Test if service call create log book entry."""
-    calls = []
+    calls = async_capture_events(hass_, logbook.EVENT_LOGBOOK_ENTRY)
 
-    @ha.callback
-    def event_listener(event):
-        """Append on event."""
-        calls.append(event)
-
-    hass_.bus.listen(logbook.EVENT_LOGBOOK_ENTRY, event_listener)
-    hass_.services.call(
+    await hass_.services.async_call(
         logbook.DOMAIN,
         "log",
         {
@@ -75,7 +79,7 @@ def test_service_call_create_logbook_entry(hass_):
         },
         True,
     )
-    hass_.services.call(
+    await hass_.services.async_call(
         logbook.DOMAIN,
         "log",
         {
@@ -87,9 +91,7 @@ def test_service_call_create_logbook_entry(hass_):
     # Logbook entry service call results in firing an event.
     # Our service call will unblock when the event listeners have been
     # scheduled. This means that they may not have been processed yet.
-    trigger_db_commit(hass_)
-    hass_.block_till_done()
-    hass_.data[recorder.DATA_INSTANCE].block_till_done()
+    await async_wait_recording_done(hass_)
 
     events = list(
         logbook._get_events(
@@ -115,91 +117,127 @@ def test_service_call_create_logbook_entry(hass_):
     assert last_call.data.get(logbook.ATTR_DOMAIN) == "logbook"
 
 
-def test_service_call_create_log_book_entry_no_message(hass_):
+async def test_service_call_create_logbook_entry_invalid_entity_id(hass, recorder_mock):
+    """Test if service call create log book entry with an invalid entity id."""
+    await async_setup_component(hass, "logbook", {})
+    await hass.async_block_till_done()
+    hass.bus.async_fire(
+        logbook.EVENT_LOGBOOK_ENTRY,
+        {
+            logbook.ATTR_NAME: "Alarm",
+            logbook.ATTR_MESSAGE: "is triggered",
+            logbook.ATTR_DOMAIN: "switch",
+            logbook.ATTR_ENTITY_ID: 1234,
+        },
+    )
+    await async_wait_recording_done(hass)
+
+    events = list(
+        logbook._get_events(
+            hass,
+            dt_util.utcnow() - timedelta(hours=1),
+            dt_util.utcnow() + timedelta(hours=1),
+        )
+    )
+    assert len(events) == 1
+    assert events[0][logbook.ATTR_DOMAIN] == "switch"
+    assert events[0][logbook.ATTR_NAME] == "Alarm"
+    assert events[0][logbook.ATTR_ENTITY_ID] == 1234
+    assert events[0][logbook.ATTR_MESSAGE] == "is triggered"
+
+
+async def test_service_call_create_log_book_entry_no_message(hass_):
     """Test if service call create log book entry without message."""
-    calls = []
-
-    @ha.callback
-    def event_listener(event):
-        """Append on event."""
-        calls.append(event)
-
-    hass_.bus.listen(logbook.EVENT_LOGBOOK_ENTRY, event_listener)
+    calls = async_capture_events(hass_, logbook.EVENT_LOGBOOK_ENTRY)
 
     with pytest.raises(vol.Invalid):
-        hass_.services.call(logbook.DOMAIN, "log", {}, True)
+        await hass_.services.async_call(logbook.DOMAIN, "log", {}, True)
 
     # Logbook entry service call results in firing an event.
     # Our service call will unblock when the event listeners have been
     # scheduled. This means that they may not have been processed yet.
-    hass_.block_till_done()
+    await hass_.async_block_till_done()
 
     assert len(calls) == 0
 
 
-def test_humanify_filter_sensor(hass_):
-    """Test humanify filter too frequent sensor values."""
-    entity_id = "sensor.bla"
+async def test_filter_sensor(hass_: ha.HomeAssistant, hass_client):
+    """Test numeric sensors are filtered."""
 
-    pointA = dt_util.utcnow().replace(minute=2)
-    pointB = pointA.replace(minute=5)
-    pointC = pointA + timedelta(minutes=logbook.GROUP_BY_MINUTES)
-    entity_attr_cache = logbook.EntityAttributeCache(hass_)
+    registry = er.async_get(hass_)
 
-    eventA = create_state_changed_event(pointA, entity_id, 10)
-    eventB = create_state_changed_event(pointB, entity_id, 20)
-    eventC = create_state_changed_event(pointC, entity_id, 30)
+    # Unregistered sensor without a unit of measurement - should be in logbook
+    entity_id1 = "sensor.bla"
+    attributes_1 = None
+    # Unregistered sensor with a unit of measurement - should be excluded from logbook
+    entity_id2 = "sensor.blu"
+    attributes_2 = {ATTR_UNIT_OF_MEASUREMENT: "cats"}
+    # Registered sensor with state class - should be excluded from logbook
+    entity_id3 = registry.async_get_or_create(
+        "sensor",
+        "test",
+        "unique_3",
+        suggested_object_id="bli",
+        capabilities={"state_class": SensorStateClass.MEASUREMENT},
+    ).entity_id
+    attributes_3 = None
+    # Registered sensor without state class or unit - should be in logbook
+    entity_id4 = registry.async_get_or_create(
+        "sensor", "test", "unique_4", suggested_object_id="ble"
+    ).entity_id
+    attributes_4 = None
 
-    entries = list(
-        logbook.humanify(hass_, (eventA, eventB, eventC), entity_attr_cache, {})
-    )
+    hass_.states.async_set(entity_id1, None, attributes_1)  # Excluded
+    hass_.states.async_set(entity_id1, 10, attributes_1)  # Included
+    hass_.states.async_set(entity_id2, None, attributes_2)  # Excluded
+    hass_.states.async_set(entity_id2, 10, attributes_2)  # Excluded
+    hass_.states.async_set(entity_id3, None, attributes_3)  # Excluded
+    hass_.states.async_set(entity_id3, 10, attributes_3)  # Excluded
+    hass_.states.async_set(entity_id1, 20, attributes_1)  # Included
+    hass_.states.async_set(entity_id2, 20, attributes_2)  # Excluded
+    hass_.states.async_set(entity_id4, None, attributes_4)  # Excluded
+    hass_.states.async_set(entity_id4, 10, attributes_4)  # Included
 
-    assert len(entries) == 2
-    assert_entry(entries[0], pointB, "bla", entity_id=entity_id)
+    await async_wait_recording_done(hass_)
+    client = await hass_client()
+    entries = await _async_fetch_logbook(client)
 
-    assert_entry(entries[1], pointC, "bla", entity_id=entity_id)
+    assert len(entries) == 3
+    _assert_entry(entries[0], name="bla", entity_id=entity_id1, state="10")
+    _assert_entry(entries[1], name="bla", entity_id=entity_id1, state="20")
+    _assert_entry(entries[2], name="ble", entity_id=entity_id4, state="10")
 
 
-def test_home_assistant_start_stop_grouped(hass_):
-    """Test if HA start and stop events are grouped.
-
-    Events that are occurring in the same minute.
-    """
-    entity_attr_cache = logbook.EntityAttributeCache(hass_)
-    entries = list(
-        logbook.humanify(
-            hass_,
-            (
-                MockLazyEventPartialState(EVENT_HOMEASSISTANT_STOP),
-                MockLazyEventPartialState(EVENT_HOMEASSISTANT_START),
-            ),
-            entity_attr_cache,
-            {},
+async def test_home_assistant_start_stop_not_grouped(hass_):
+    """Test if HA start and stop events are no longer grouped."""
+    await async_setup_component(hass_, "homeassistant", {})
+    await hass_.async_block_till_done()
+    entries = mock_humanify(
+        hass_,
+        (
+            MockRow(EVENT_HOMEASSISTANT_STOP),
+            MockRow(EVENT_HOMEASSISTANT_START),
         ),
     )
 
-    assert len(entries) == 1
-    assert_entry(
-        entries[0], name="Home Assistant", message="restarted", domain=ha.DOMAIN
-    )
+    assert len(entries) == 2
+    assert_entry(entries[0], name="Home Assistant", message="stopped", domain=ha.DOMAIN)
+    assert_entry(entries[1], name="Home Assistant", message="started", domain=ha.DOMAIN)
 
 
-def test_home_assistant_start(hass_):
+async def test_home_assistant_start(hass_):
     """Test if HA start is not filtered or converted into a restart."""
+    await async_setup_component(hass_, "homeassistant", {})
+    await hass_.async_block_till_done()
     entity_id = "switch.bla"
     pointA = dt_util.utcnow()
-    entity_attr_cache = logbook.EntityAttributeCache(hass_)
 
-    entries = list(
-        logbook.humanify(
-            hass_,
-            (
-                MockLazyEventPartialState(EVENT_HOMEASSISTANT_START),
-                create_state_changed_event(pointA, entity_id, 10),
-            ),
-            entity_attr_cache,
-            {},
-        )
+    entries = mock_humanify(
+        hass_,
+        (
+            MockRow(EVENT_HOMEASSISTANT_START),
+            create_state_changed_event(pointA, entity_id, 10).row,
+        ),
     )
 
     assert len(entries) == 2
@@ -212,31 +250,25 @@ def test_process_custom_logbook_entries(hass_):
     name = "Nice name"
     message = "has a custom entry"
     entity_id = "sun.sun"
-    entity_attr_cache = logbook.EntityAttributeCache(hass_)
 
-    entries = list(
-        logbook.humanify(
-            hass_,
-            (
-                MockLazyEventPartialState(
-                    logbook.EVENT_LOGBOOK_ENTRY,
-                    {
-                        logbook.ATTR_NAME: name,
-                        logbook.ATTR_MESSAGE: message,
-                        logbook.ATTR_ENTITY_ID: entity_id,
-                    },
-                ),
+    entries = mock_humanify(
+        hass_,
+        (
+            MockRow(
+                logbook.EVENT_LOGBOOK_ENTRY,
+                {
+                    logbook.ATTR_NAME: name,
+                    logbook.ATTR_MESSAGE: message,
+                    logbook.ATTR_ENTITY_ID: entity_id,
+                },
             ),
-            entity_attr_cache,
-            {},
-        )
+        ),
     )
 
     assert len(entries) == 1
     assert_entry(entries[0], name=name, message=message, entity_id=entity_id)
 
 
-# pylint: disable=no-self-use
 def assert_entry(
     entry, when=None, name=None, message=None, domain=None, entity_id=None
 ):
@@ -265,7 +297,6 @@ def create_state_changed_event(
     )
 
 
-# pylint: disable=no-self-use
 def create_state_changed_event_from_old_new(
     entity_id, event_time_fired, old_state, new_state
 ):
@@ -289,39 +320,66 @@ def create_state_changed_event_from_old_new(
             "attributes"
             "state_id",
             "old_state_id",
+            "shared_attrs",
+            "shared_data",
+            "context_only",
         ],
     )
 
-    row.event_type = EVENT_STATE_CHANGED
+    row.event_type = logbook.PSUEDO_EVENT_STATE_CHANGED
     row.event_data = "{}"
+    row.shared_data = "{}"
     row.attributes = attributes_json
+    row.shared_attrs = attributes_json
     row.time_fired = event_time_fired
     row.state = new_state and new_state.get("state")
     row.entity_id = entity_id
     row.domain = entity_id and ha.split_entity_id(entity_id)[0]
+    row.context_only = False
     row.context_id = None
+    row.friendly_name = None
+    row.icon = None
+    row.old_format_icon = None
     row.context_user_id = None
     row.context_parent_id = None
     row.old_state_id = old_state and 1
     row.state_id = new_state and 1
-    return logbook.LazyEventPartialState(row)
+    return logbook.LazyEventPartialState(row, {})
 
 
-async def test_logbook_view(hass, hass_client):
+async def test_logbook_view(hass, hass_client, recorder_mock):
     """Test the logbook view."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
     await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
     client = await hass_client()
     response = await client.get(f"/api/logbook/{dt_util.utcnow().isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
 
 
-async def test_logbook_view_period_entity(hass, hass_client):
-    """Test the logbook view with period and entity."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
+async def test_logbook_view_invalid_start_date_time(hass, hass_client, recorder_mock):
+    """Test the logbook view with an invalid date time."""
     await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
+    client = await hass_client()
+    response = await client.get("/api/logbook/INVALID")
+    assert response.status == HTTPStatus.BAD_REQUEST
+
+
+async def test_logbook_view_invalid_end_date_time(hass, hass_client, recorder_mock):
+    """Test the logbook view."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
+    client = await hass_client()
+    response = await client.get(
+        f"/api/logbook/{dt_util.utcnow().isoformat()}?end_time=INVALID"
+    )
+    assert response.status == HTTPStatus.BAD_REQUEST
+
+
+async def test_logbook_view_period_entity(hass, hass_client, recorder_mock, set_utc):
+    """Test the logbook view with period and entity."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
 
     entity_id_test = "switch.test"
     hass.states.async_set(entity_id_test, STATE_OFF)
@@ -329,9 +387,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
     entity_id_second = "switch.second"
     hass.states.async_set(entity_id_second, STATE_OFF)
     hass.states.async_set(entity_id_second, STATE_ON)
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -341,7 +397,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 2
     assert response_json[0]["entity_id"] == entity_id_test
@@ -349,7 +405,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
 
     # Test today entries with filter by period
     response = await client.get(f"/api/logbook/{start_date.isoformat()}?period=1")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 2
     assert response_json[0]["entity_id"] == entity_id_test
@@ -359,7 +415,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?entity=switch.test"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 1
     assert response_json[0]["entity_id"] == entity_id_test
@@ -368,7 +424,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?period=3&entity=switch.test"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 1
     assert response_json[0]["entity_id"] == entity_id_test
@@ -379,7 +435,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
 
     # Test tomorrow entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 0
 
@@ -387,7 +443,7 @@ async def test_logbook_view_period_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?entity=switch.test"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 0
 
@@ -395,15 +451,14 @@ async def test_logbook_view_period_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?period=3&entity=switch.test"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 1
     assert response_json[0]["entity_id"] == entity_id_test
 
 
-async def test_logbook_describe_event(hass, hass_client):
+async def test_logbook_describe_event(hass, hass_client, recorder_mock):
     """Test teaching logbook about a new event."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
 
     def _describe(event):
         """Describe an event."""
@@ -426,12 +481,7 @@ async def test_logbook_describe_event(hass, hass_client):
         return_value=dt_util.utcnow() - timedelta(seconds=5),
     ):
         hass.bus.async_fire("some_event")
-        await hass.async_block_till_done()
-        await hass.async_add_executor_job(trigger_db_commit, hass)
-        await hass.async_block_till_done()
-        await hass.async_add_executor_job(
-            hass.data[recorder.DATA_INSTANCE].block_till_done
-        )
+        await async_wait_recording_done(hass)
 
     client = await hass_client()
     response = await client.get("/api/logbook")
@@ -443,7 +493,7 @@ async def test_logbook_describe_event(hass, hass_client):
     assert event["domain"] == "test_domain"
 
 
-async def test_exclude_described_event(hass, hass_client):
+async def test_exclude_described_event(hass, hass_client, recorder_mock):
     """Test exclusions of events that are described by another integration."""
     name = "My Automation Rule"
     entity_id = "automation.excluded_rule"
@@ -470,7 +520,6 @@ async def test_exclude_described_event(hass, hass_client):
         Mock(async_describe_events=async_describe_events),
     )
 
-    await hass.async_add_executor_job(init_recorder_component, hass)
     assert await async_setup_component(
         hass,
         logbook.DOMAIN,
@@ -496,12 +545,7 @@ async def test_exclude_described_event(hass, hass_client):
         hass.bus.async_fire(
             "some_event", {logbook.ATTR_NAME: name, logbook.ATTR_ENTITY_ID: entity_id3}
         )
-        await hass.async_block_till_done()
-        await hass.async_add_executor_job(trigger_db_commit, hass)
-        await hass.async_block_till_done()
-        await hass.async_add_executor_job(
-            hass.data[recorder.DATA_INSTANCE].block_till_done
-        )
+        await async_wait_recording_done(hass)
 
     client = await hass_client()
     response = await client.get("/api/logbook")
@@ -512,11 +556,10 @@ async def test_exclude_described_event(hass, hass_client):
     assert event["entity_id"] == "automation.included_rule"
 
 
-async def test_logbook_view_end_time_entity(hass, hass_client):
+async def test_logbook_view_end_time_entity(hass, hass_client, recorder_mock):
     """Test the logbook view with end_time and entity."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
     await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
 
     entity_id_test = "switch.test"
     hass.states.async_set(entity_id_test, STATE_OFF)
@@ -524,9 +567,7 @@ async def test_logbook_view_end_time_entity(hass, hass_client):
     entity_id_second = "switch.second"
     hass.states.async_set(entity_id_second, STATE_OFF)
     hass.states.async_set(entity_id_second, STATE_ON)
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -539,7 +580,7 @@ async def test_logbook_view_end_time_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 2
     assert response_json[0]["entity_id"] == entity_id_test
@@ -550,7 +591,7 @@ async def test_logbook_view_end_time_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 1
     assert response_json[0]["entity_id"] == entity_id_test
@@ -564,20 +605,22 @@ async def test_logbook_view_end_time_entity(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
     assert len(response_json) == 1
     assert response_json[0]["entity_id"] == entity_id_test
 
 
-async def test_logbook_entity_filter_with_automations(hass, hass_client):
+async def test_logbook_entity_filter_with_automations(hass, hass_client, recorder_mock):
     """Test the logbook view with end_time and entity with automations and scripts."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await async_setup_component(hass, "automation", {})
-    await async_setup_component(hass, "script", {})
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook", "automation", "script")
+        ]
+    )
 
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
 
     entity_id_test = "alarm_control_panel.area_001"
     hass.states.async_set(entity_id_test, STATE_OFF)
@@ -596,9 +639,7 @@ async def test_logbook_entity_filter_with_automations(hass, hass_client):
     )
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -611,7 +652,7 @@ async def test_logbook_entity_filter_with_automations(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
 
     assert json_dict[0]["entity_id"] == entity_id_test
@@ -625,7 +666,7 @@ async def test_logbook_entity_filter_with_automations(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=alarm_control_panel.area_001"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
     assert len(json_dict) == 1
     assert json_dict[0]["entity_id"] == entity_id_test
@@ -639,17 +680,56 @@ async def test_logbook_entity_filter_with_automations(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=alarm_control_panel.area_002"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
     assert len(json_dict) == 1
     assert json_dict[0]["entity_id"] == entity_id_second
 
 
-async def test_filter_continuous_sensor_values(hass, hass_client):
-    """Test remove continuous sensor events from logbook."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
+async def test_logbook_entity_no_longer_in_state_machine(
+    hass, hass_client, recorder_mock
+):
+    """Test the logbook view with an entity that hass been removed from the state machine."""
     await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_setup_component(hass, "automation", {})
+    await async_setup_component(hass, "script", {})
+
+    await async_wait_recording_done(hass)
+
+    entity_id_test = "alarm_control_panel.area_001"
+    hass.states.async_set(
+        entity_id_test, STATE_OFF, {ATTR_FRIENDLY_NAME: "Alarm Control Panel"}
+    )
+    hass.states.async_set(
+        entity_id_test, STATE_ON, {ATTR_FRIENDLY_NAME: "Alarm Control Panel"}
+    )
+
+    await async_wait_recording_done(hass)
+
+    hass.states.async_remove(entity_id_test)
+
+    client = await hass_client()
+
+    # Today time 00:00:00
+    start = dt_util.utcnow().date()
+    start_date = datetime(start.year, start.month, start.day)
+
+    # Test today entries with filter by end_time
+    end_time = start + timedelta(hours=24)
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+    assert json_dict[0]["name"] == "area 001"
+
+
+async def test_filter_continuous_sensor_values(
+    hass, hass_client, recorder_mock, set_utc
+):
+    """Test remove continuous sensor events from logbook."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
 
     entity_id_test = "switch.test"
     hass.states.async_set(entity_id_test, STATE_OFF)
@@ -661,9 +741,7 @@ async def test_filter_continuous_sensor_values(hass, hass_client):
     hass.states.async_set(entity_id_third, STATE_OFF, {"unit_of_measurement": "foo"})
     hass.states.async_set(entity_id_third, STATE_ON, {"unit_of_measurement": "foo"})
 
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -673,7 +751,7 @@ async def test_filter_continuous_sensor_values(hass, hass_client):
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
 
     assert len(response_json) == 2
@@ -681,11 +759,15 @@ async def test_filter_continuous_sensor_values(hass, hass_client):
     assert response_json[1]["entity_id"] == entity_id_third
 
 
-async def test_exclude_new_entities(hass, hass_client):
+async def test_exclude_new_entities(hass, hass_client, recorder_mock, set_utc):
     """Test if events are excluded on first update."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook")
+        ]
+    )
+    await async_recorder_block_till_done(hass)
 
     entity_id = "climate.bla"
     entity_id2 = "climate.blu"
@@ -695,9 +777,7 @@ async def test_exclude_new_entities(hass, hass_client):
     hass.states.async_set(entity_id2, STATE_OFF)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -707,7 +787,7 @@ async def test_exclude_new_entities(hass, hass_client):
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
 
     assert len(response_json) == 2
@@ -716,11 +796,15 @@ async def test_exclude_new_entities(hass, hass_client):
     assert response_json[1]["message"] == "started"
 
 
-async def test_exclude_removed_entities(hass, hass_client):
+async def test_exclude_removed_entities(hass, hass_client, recorder_mock, set_utc):
     """Test if events are excluded on last update."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook")
+        ]
+    )
+    await async_recorder_block_till_done(hass)
 
     entity_id = "climate.bla"
     entity_id2 = "climate.blu"
@@ -736,9 +820,7 @@ async def test_exclude_removed_entities(hass, hass_client):
     hass.states.async_remove(entity_id)
     hass.states.async_remove(entity_id2)
 
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -748,7 +830,7 @@ async def test_exclude_removed_entities(hass, hass_client):
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
 
     assert len(response_json) == 3
@@ -758,11 +840,15 @@ async def test_exclude_removed_entities(hass, hass_client):
     assert response_json[2]["entity_id"] == entity_id2
 
 
-async def test_exclude_attribute_changes(hass, hass_client):
+async def test_exclude_attribute_changes(hass, hass_client, recorder_mock, set_utc):
     """Test if events of attribute changes are filtered."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook")
+        ]
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
@@ -775,9 +861,7 @@ async def test_exclude_attribute_changes(hass, hass_client):
 
     await hass.async_block_till_done()
 
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -787,7 +871,7 @@ async def test_exclude_attribute_changes(hass, hass_client):
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     response_json = await response.json()
 
     assert len(response_json) == 3
@@ -796,14 +880,16 @@ async def test_exclude_attribute_changes(hass, hass_client):
     assert response_json[2]["entity_id"] == "light.kitchen"
 
 
-async def test_logbook_entity_context_id(hass, hass_client):
+async def test_logbook_entity_context_id(hass, recorder_mock, hass_client):
     """Test the logbook view with end_time and entity with automations and scripts."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await async_setup_component(hass, "automation", {})
-    await async_setup_component(hass, "script", {})
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook", "automation", "script")
+        ]
+    )
 
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
 
     context = ha.Context(
         id="ac5bd62de45711eaaeb351041eec8dd9",
@@ -887,11 +973,7 @@ async def test_logbook_entity_context_id(hass, hass_client):
     hass.states.async_set(
         "light.switch", STATE_OFF, context=light_turn_off_service_context
     )
-    await hass.async_block_till_done()
-
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -904,7 +986,7 @@ async def test_logbook_entity_context_id(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
 
     assert json_dict[0]["entity_id"] == "automation.alarm"
@@ -948,14 +1030,107 @@ async def test_logbook_entity_context_id(hass, hass_client):
     assert json_dict[7]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_logbook_entity_context_parent_id(hass, hass_client):
-    """Test the logbook view links events via context parent_id."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await async_setup_component(hass, "automation", {})
-    await async_setup_component(hass, "script", {})
+async def test_logbook_context_id_automation_script_started_manually(
+    hass, recorder_mock, hass_client
+):
+    """Test the logbook populates context_ids for scripts and automations started manually."""
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook", "automation", "script")
+        ]
+    )
 
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
+
+    # An Automation
+    automation_entity_id_test = "automation.alarm"
+    automation_context = ha.Context(
+        id="fc5bd62de45711eaaeb351041eec8dd9",
+        user_id="f400facee45711eaa9308bfd3d19e474",
+    )
+    hass.bus.async_fire(
+        EVENT_AUTOMATION_TRIGGERED,
+        {ATTR_NAME: "Mock automation", ATTR_ENTITY_ID: automation_entity_id_test},
+        context=automation_context,
+    )
+    script_context = ha.Context(
+        id="ac5bd62de45711eaaeb351041eec8dd9",
+        user_id="b400facee45711eaa9308bfd3d19e474",
+    )
+    hass.bus.async_fire(
+        EVENT_SCRIPT_STARTED,
+        {ATTR_NAME: "Mock script", ATTR_ENTITY_ID: "script.mock_script"},
+        context=script_context,
+    )
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+
+    script_2_context = ha.Context(
+        id="1234",
+        user_id="b400facee45711eaa9308bfd3d19e474",
+    )
+    hass.bus.async_fire(
+        EVENT_SCRIPT_STARTED,
+        {ATTR_NAME: "Mock script"},
+        context=script_2_context,
+    )
+    hass.states.async_set("switch.new", STATE_ON, context=script_2_context)
+    hass.states.async_set("switch.new", STATE_OFF, context=script_2_context)
+
+    await hass.async_block_till_done()
+    await async_wait_recording_done(hass)
+
+    client = await hass_client()
+
+    # Today time 00:00:00
+    start = dt_util.utcnow().date()
+    start_date = datetime(start.year, start.month, start.day)
+
+    # Test today entries with filter by end_time
+    end_time = start + timedelta(hours=24)
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    assert json_dict[0]["entity_id"] == "automation.alarm"
+    assert "context_entity_id" not in json_dict[0]
+    assert json_dict[0]["context_user_id"] == "f400facee45711eaa9308bfd3d19e474"
+    assert json_dict[0]["context_id"] == "fc5bd62de45711eaaeb351041eec8dd9"
+
+    assert json_dict[1]["entity_id"] == "script.mock_script"
+    assert "context_entity_id" not in json_dict[1]
+    assert json_dict[1]["context_user_id"] == "b400facee45711eaa9308bfd3d19e474"
+    assert json_dict[1]["context_id"] == "ac5bd62de45711eaaeb351041eec8dd9"
+
+    assert json_dict[2]["domain"] == "homeassistant"
+
+    assert json_dict[3]["entity_id"] is None
+    assert json_dict[3]["name"] == "Mock script"
+    assert "context_entity_id" not in json_dict[1]
+    assert json_dict[3]["context_user_id"] == "b400facee45711eaa9308bfd3d19e474"
+    assert json_dict[3]["context_id"] == "1234"
+
+    assert json_dict[4]["entity_id"] == "switch.new"
+    assert json_dict[4]["state"] == "off"
+    assert "context_entity_id" not in json_dict[1]
+    assert json_dict[4]["context_user_id"] == "b400facee45711eaa9308bfd3d19e474"
+    assert json_dict[4]["context_event_type"] == "script_started"
+    assert json_dict[4]["context_domain"] == "script"
+
+
+async def test_logbook_entity_context_parent_id(hass, hass_client, recorder_mock):
+    """Test the logbook view links events via context parent_id."""
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook", "automation", "script")
+        ]
+    )
+
+    await async_recorder_block_till_done(hass)
 
     context = ha.Context(
         id="ac5bd62de45711eaaeb351041eec8dd9",
@@ -1060,11 +1235,7 @@ async def test_logbook_entity_context_parent_id(hass, hass_client):
         "alarm_control_panel.area_009",
         missing_parent_context,
     )
-    await hass.async_block_till_done()
-
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -1077,7 +1248,7 @@ async def test_logbook_entity_context_parent_id(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
 
     assert json_dict[0]["entity_id"] == "automation.alarm"
@@ -1129,10 +1300,15 @@ async def test_logbook_entity_context_parent_id(hass, hass_client):
     assert json_dict[8]["context_user_id"] == "485cacf93ef84d25a99ced3126b921d2"
 
 
-async def test_logbook_context_from_template(hass, hass_client):
+async def test_logbook_context_from_template(hass, hass_client, recorder_mock):
     """Test the logbook view with end_time and entity with automations and scripts."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook")
+        ]
+    )
+
     assert await async_setup_component(
         hass,
         "switch",
@@ -1155,7 +1331,7 @@ async def test_logbook_context_from_template(hass, hass_client):
             }
         },
     )
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
     await hass.async_block_till_done()
     await hass.async_start()
     await hass.async_block_till_done()
@@ -1175,11 +1351,7 @@ async def test_logbook_context_from_template(hass, hass_client):
     hass.states.async_set(
         "switch.test_state", STATE_ON, context=switch_turn_off_context
     )
-    await hass.async_block_till_done()
-
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -1192,7 +1364,7 @@ async def test_logbook_context_from_template(hass, hass_client):
     response = await client.get(
         f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
 
     assert json_dict[0]["domain"] == "homeassistant"
@@ -1215,9 +1387,8 @@ async def test_logbook_context_from_template(hass, hass_client):
     assert json_dict[5]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_logbook_entity_matches_only(hass, hass_client):
-    """Test the logbook view with a single entity and entity_matches_only."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
+async def test_logbook_(hass, hass_client, recorder_mock):
+    """Test the logbook view with a single entity and ."""
     await async_setup_component(hass, "logbook", {})
     assert await async_setup_component(
         hass,
@@ -1241,7 +1412,7 @@ async def test_logbook_entity_matches_only(hass, hass_client):
             }
         },
     )
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
     await hass.async_block_till_done()
     await hass.async_start()
     await hass.async_block_till_done()
@@ -1261,11 +1432,7 @@ async def test_logbook_entity_matches_only(hass, hass_client):
     hass.states.async_set(
         "switch.test_state", STATE_ON, context=switch_turn_off_context
     )
-    await hass.async_block_till_done()
-
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -1276,9 +1443,9 @@ async def test_logbook_entity_matches_only(hass, hass_client):
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test_state&entity_matches_only"
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test_state"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
 
     assert len(json_dict) == 2
@@ -1289,9 +1456,113 @@ async def test_logbook_entity_matches_only(hass, hass_client):
     assert json_dict[1]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_logbook_entity_matches_only_multiple(hass, hass_client):
-    """Test the logbook view with a multiple entities and entity_matches_only."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
+async def test_logbook_many_entities_multiple_calls(hass, hass_client, recorder_mock):
+    """Test the logbook view with a many entities called multiple times."""
+    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, "automation", {})
+
+    await async_recorder_block_till_done(hass)
+    await hass.async_block_till_done()
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    for automation_id in range(5):
+        hass.bus.async_fire(
+            EVENT_AUTOMATION_TRIGGERED,
+            {
+                ATTR_NAME: f"Mock automation {automation_id}",
+                ATTR_ENTITY_ID: f"automation.mock_{automation_id}_automation",
+            },
+        )
+    await async_wait_recording_done(hass)
+    client = await hass_client()
+
+    # Today time 00:00:00
+    start = dt_util.utcnow().date()
+    start_date = datetime(start.year, start.month, start.day)
+    end_time = start + timedelta(hours=24)
+
+    for automation_id in range(5):
+        # Test today entries with filter by end_time
+        response = await client.get(
+            f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=automation.mock_{automation_id}_automation"
+        )
+        assert response.status == HTTPStatus.OK
+        json_dict = await response.json()
+
+        assert len(json_dict) == 1
+        assert (
+            json_dict[0]["entity_id"] == f"automation.mock_{automation_id}_automation"
+        )
+
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=automation.mock_0_automation,automation.mock_1_automation,automation.mock_2_automation"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    assert len(json_dict) == 3
+    assert json_dict[0]["entity_id"] == "automation.mock_0_automation"
+    assert json_dict[1]["entity_id"] == "automation.mock_1_automation"
+    assert json_dict[2]["entity_id"] == "automation.mock_2_automation"
+
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=automation.mock_4_automation,automation.mock_2_automation,automation.mock_0_automation,automation.mock_1_automation"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    assert len(json_dict) == 4
+    assert json_dict[0]["entity_id"] == "automation.mock_0_automation"
+    assert json_dict[1]["entity_id"] == "automation.mock_1_automation"
+    assert json_dict[2]["entity_id"] == "automation.mock_2_automation"
+    assert json_dict[3]["entity_id"] == "automation.mock_4_automation"
+
+    response = await client.get(
+        f"/api/logbook/{end_time.isoformat()}?end_time={end_time}&entity=automation.mock_4_automation,automation.mock_2_automation,automation.mock_0_automation,automation.mock_1_automation"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+    assert len(json_dict) == 0
+
+
+async def test_custom_log_entry_discoverable_via_(hass, hass_client, recorder_mock):
+    """Test if a custom log entry is later discoverable via ."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
+
+    logbook.async_log_entry(
+        hass,
+        "Alarm",
+        "is triggered",
+        "switch",
+        "switch.test_switch",
+    )
+    await async_wait_recording_done(hass)
+
+    client = await hass_client()
+
+    # Today time 00:00:00
+    start = dt_util.utcnow().date()
+    start_date = datetime(start.year, start.month, start.day)
+
+    # Test today entries with filter by end_time
+    end_time = start + timedelta(hours=24)
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time.isoformat()}&entity=switch.test_switch"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    assert len(json_dict) == 1
+
+    assert json_dict[0]["name"] == "Alarm"
+    assert json_dict[0]["message"] == "is triggered"
+    assert json_dict[0]["entity_id"] == "switch.test_switch"
+
+
+async def test_logbook_multiple_entities(hass, hass_client, recorder_mock):
+    """Test the logbook view with a multiple entities."""
     await async_setup_component(hass, "logbook", {})
     assert await async_setup_component(
         hass,
@@ -1315,7 +1586,7 @@ async def test_logbook_entity_matches_only_multiple(hass, hass_client):
             }
         },
     )
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
     await hass.async_block_till_done()
     await hass.async_start()
     await hass.async_block_till_done()
@@ -1323,12 +1594,14 @@ async def test_logbook_entity_matches_only_multiple(hass, hass_client):
     # Entity added (should not be logged)
     hass.states.async_set("switch.test_state", STATE_ON)
     hass.states.async_set("light.test_state", STATE_ON)
+    hass.states.async_set("binary_sensor.test_state", STATE_ON)
 
     await hass.async_block_till_done()
 
     # First state change (should be logged)
     hass.states.async_set("switch.test_state", STATE_OFF)
     hass.states.async_set("light.test_state", STATE_OFF)
+    hass.states.async_set("binary_sensor.test_state", STATE_OFF)
 
     await hass.async_block_till_done()
 
@@ -1340,11 +1613,10 @@ async def test_logbook_entity_matches_only_multiple(hass, hass_client):
         "switch.test_state", STATE_ON, context=switch_turn_off_context
     )
     hass.states.async_set("light.test_state", STATE_ON, context=switch_turn_off_context)
-    await hass.async_block_till_done()
-
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    hass.states.async_set(
+        "binary_sensor.test_state", STATE_ON, context=switch_turn_off_context
+    )
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
 
@@ -1355,9 +1627,9 @@ async def test_logbook_entity_matches_only_multiple(hass, hass_client):
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test_state,light.test_state&entity_matches_only"
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test_state,light.test_state"
     )
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     json_dict = await response.json()
 
     assert len(json_dict) == 4
@@ -1372,10 +1644,49 @@ async def test_logbook_entity_matches_only_multiple(hass, hass_client):
     assert json_dict[3]["entity_id"] == "light.test_state"
     assert json_dict[3]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
+    # Test today entries with filter by end_time
+    end_time = start + timedelta(hours=24)
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=binary_sensor.test_state,light.test_state"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
 
-async def test_logbook_invalid_entity(hass, hass_client):
+    assert len(json_dict) == 4
+
+    assert json_dict[0]["entity_id"] == "light.test_state"
+
+    assert json_dict[1]["entity_id"] == "binary_sensor.test_state"
+
+    assert json_dict[2]["entity_id"] == "light.test_state"
+    assert json_dict[2]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
+
+    assert json_dict[3]["entity_id"] == "binary_sensor.test_state"
+    assert json_dict[3]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
+
+    # Test today entries with filter by end_time
+    end_time = start + timedelta(hours=24)
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=light.test_state,binary_sensor.test_state"
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    assert len(json_dict) == 4
+
+    assert json_dict[0]["entity_id"] == "light.test_state"
+
+    assert json_dict[1]["entity_id"] == "binary_sensor.test_state"
+
+    assert json_dict[2]["entity_id"] == "light.test_state"
+    assert json_dict[2]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
+
+    assert json_dict[3]["entity_id"] == "binary_sensor.test_state"
+    assert json_dict[3]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
+
+
+async def test_logbook_invalid_entity(hass, hass_client, recorder_mock):
     """Test the logbook view with requesting an invalid entity."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
     await async_setup_component(hass, "logbook", {})
     await hass.async_block_till_done()
     client = await hass_client()
@@ -1387,16 +1698,21 @@ async def test_logbook_invalid_entity(hass, hass_client):
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=invalid&entity_matches_only"
+        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=invalid"
     )
-    assert response.status == 500
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
 
 
-async def test_icon_and_state(hass, hass_client):
+async def test_icon_and_state(hass, hass_client, recorder_mock):
     """Test to ensure state and custom icons are returned."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook")
+        ]
+    )
+
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
@@ -1415,7 +1731,7 @@ async def test_icon_and_state(hass, hass_client):
     )
     hass.states.async_set("light.kitchen", STATE_OFF, {"icon": "mdi:chemical-weapon"})
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
     response_json = await _async_fetch_logbook(client)
@@ -1430,20 +1746,56 @@ async def test_icon_and_state(hass, hass_client):
     assert response_json[2]["state"] == STATE_OFF
 
 
-async def test_exclude_events_domain(hass, hass_client):
+async def test_fire_logbook_entries(hass, hass_client, recorder_mock):
+    """Test many logbook entry calls."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
+
+    for _ in range(10):
+        hass.bus.async_fire(
+            logbook.EVENT_LOGBOOK_ENTRY,
+            {
+                logbook.ATTR_NAME: "Alarm",
+                logbook.ATTR_MESSAGE: "is triggered",
+                logbook.ATTR_DOMAIN: "switch",
+                logbook.ATTR_ENTITY_ID: "sensor.xyz",
+            },
+        )
+        hass.bus.async_fire(
+            logbook.EVENT_LOGBOOK_ENTRY,
+            {},
+        )
+    hass.bus.async_fire(
+        logbook.EVENT_LOGBOOK_ENTRY,
+        {
+            logbook.ATTR_NAME: "Alarm",
+            logbook.ATTR_MESSAGE: "is triggered",
+            logbook.ATTR_DOMAIN: "switch",
+        },
+    )
+    await async_wait_recording_done(hass)
+
+    client = await hass_client()
+    response_json = await _async_fetch_logbook(client)
+
+    # The empty events should be skipped
+    assert len(response_json) == 11
+
+
+async def test_exclude_events_domain(hass, hass_client, recorder_mock):
     """Test if events are filtered if domain is excluded in config."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
 
+    await async_setup_component(hass, "homeassistant", {})
     config = logbook.CONFIG_SCHEMA(
         {
             ha.DOMAIN: {},
             logbook.DOMAIN: {CONF_EXCLUDE: {CONF_DOMAINS: ["switch", "alexa"]}},
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
     await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1452,7 +1804,7 @@ async def test_exclude_events_domain(hass, hass_client):
     hass.states.async_set(entity_id2, None)
     hass.states.async_set(entity_id2, 20)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
 
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
@@ -1464,7 +1816,7 @@ async def test_exclude_events_domain(hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_exclude_events_domain_glob(hass, hass_client):
+async def test_exclude_events_domain_glob(hass, hass_client, recorder_mock):
     """Test if events are filtered if domain or glob is excluded in config."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -1481,9 +1833,11 @@ async def test_exclude_events_domain_glob(hass, hass_client):
             },
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1494,7 +1848,7 @@ async def test_exclude_events_domain_glob(hass, hass_client):
     hass.states.async_set(entity_id3, None)
     hass.states.async_set(entity_id3, 30)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
@@ -1505,7 +1859,7 @@ async def test_exclude_events_domain_glob(hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_include_events_entity(hass, hass_client):
+async def test_include_events_entity(hass, hass_client, recorder_mock):
     """Test if events are filtered if entity is included in config."""
     entity_id = "sensor.bla"
     entity_id2 = "sensor.blu"
@@ -1521,9 +1875,11 @@ async def test_include_events_entity(hass, hass_client):
             },
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1532,7 +1888,7 @@ async def test_include_events_entity(hass, hass_client):
     hass.states.async_set(entity_id2, None)
     hass.states.async_set(entity_id2, 20)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
@@ -1543,7 +1899,7 @@ async def test_include_events_entity(hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_exclude_events_entity(hass, hass_client):
+async def test_exclude_events_entity(hass, hass_client, recorder_mock):
     """Test if events are filtered if entity is excluded in config."""
     entity_id = "sensor.bla"
     entity_id2 = "sensor.blu"
@@ -1554,9 +1910,11 @@ async def test_exclude_events_entity(hass, hass_client):
             logbook.DOMAIN: {CONF_EXCLUDE: {CONF_ENTITIES: [entity_id]}},
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1565,7 +1923,7 @@ async def test_exclude_events_entity(hass, hass_client):
     hass.states.async_set(entity_id2, None)
     hass.states.async_set(entity_id2, 20)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
     assert len(entries) == 2
@@ -1575,7 +1933,7 @@ async def test_exclude_events_entity(hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_include_events_domain(hass, hass_client):
+async def test_include_events_domain(hass, hass_client, recorder_mock):
     """Test if events are filtered if domain is included in config."""
     assert await async_setup_component(hass, "alexa", {})
     entity_id = "switch.bla"
@@ -1588,9 +1946,11 @@ async def test_include_events_domain(hass, hass_client):
             },
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1603,7 +1963,7 @@ async def test_include_events_domain(hass, hass_client):
     hass.states.async_set(entity_id2, None)
     hass.states.async_set(entity_id2, 20)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
@@ -1615,7 +1975,7 @@ async def test_include_events_domain(hass, hass_client):
     _assert_entry(entries[2], name="blu", entity_id=entity_id2)
 
 
-async def test_include_events_domain_glob(hass, hass_client):
+async def test_include_events_domain_glob(hass, hass_client, recorder_mock):
     """Test if events are filtered if domain or glob is included in config."""
     assert await async_setup_component(hass, "alexa", {})
     entity_id = "switch.bla"
@@ -1632,10 +1992,21 @@ async def test_include_events_domain_glob(hass, hass_client):
             },
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
+    # Should get excluded by domain
+    hass.bus.async_fire(
+        logbook.EVENT_LOGBOOK_ENTRY,
+        {
+            logbook.ATTR_NAME: "Alarm",
+            logbook.ATTR_MESSAGE: "is triggered",
+            logbook.ATTR_DOMAIN: "switch",
+        },
+    )
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
     hass.bus.async_fire(
@@ -1649,7 +2020,7 @@ async def test_include_events_domain_glob(hass, hass_client):
     hass.states.async_set(entity_id3, None)
     hass.states.async_set(entity_id3, 30)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
@@ -1662,7 +2033,7 @@ async def test_include_events_domain_glob(hass, hass_client):
     _assert_entry(entries[3], name="included", entity_id=entity_id3)
 
 
-async def test_include_exclude_events(hass, hass_client):
+async def test_include_exclude_events(hass, hass_client, recorder_mock):
     """Test if events are filtered if include and exclude is configured."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -1684,9 +2055,11 @@ async def test_include_exclude_events(hass, hass_client):
             },
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1701,19 +2074,22 @@ async def test_include_exclude_events(hass, hass_client):
     hass.states.async_set(entity_id4, None)
     hass.states.async_set(entity_id4, 10)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
-    assert len(entries) == 3
+    assert len(entries) == 4
     _assert_entry(
         entries[0], name="Home Assistant", message="started", domain=ha.DOMAIN
     )
-    _assert_entry(entries[1], name="blu", entity_id=entity_id2)
-    _assert_entry(entries[2], name="keep", entity_id=entity_id4)
+    _assert_entry(entries[1], name="blu", entity_id=entity_id2, state="10")
+    _assert_entry(entries[2], name="blu", entity_id=entity_id2, state="20")
+    _assert_entry(entries[3], name="keep", entity_id=entity_id4, state="10")
 
 
-async def test_include_exclude_events_with_glob_filters(hass, hass_client):
+async def test_include_exclude_events_with_glob_filters(
+    hass, hass_client, recorder_mock
+):
     """Test if events are filtered if include and exclude is configured."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -1738,9 +2114,11 @@ async def test_include_exclude_events_with_glob_filters(hass, hass_client):
             },
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
@@ -1759,19 +2137,20 @@ async def test_include_exclude_events_with_glob_filters(hass, hass_client):
     hass.states.async_set(entity_id6, None)
     hass.states.async_set(entity_id6, 30)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
-    assert len(entries) == 3
+    assert len(entries) == 4
     _assert_entry(
         entries[0], name="Home Assistant", message="started", domain=ha.DOMAIN
     )
-    _assert_entry(entries[1], name="blu", entity_id=entity_id2)
-    _assert_entry(entries[2], name="included", entity_id=entity_id4)
+    _assert_entry(entries[1], name="blu", entity_id=entity_id2, state="10")
+    _assert_entry(entries[2], name="blu", entity_id=entity_id2, state="20")
+    _assert_entry(entries[3], name="included", entity_id=entity_id4, state="30")
 
 
-async def test_empty_config(hass, hass_client):
+async def test_empty_config(hass, hass_client, recorder_mock):
     """Test we can handle an empty entity filter."""
     entity_id = "sensor.blu"
 
@@ -1781,16 +2160,18 @@ async def test_empty_config(hass, hass_client):
             logbook.DOMAIN: {},
         }
     )
-    await hass.async_add_executor_job(init_recorder_component, hass)
-    await async_setup_component(hass, "logbook", config)
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await asyncio.gather(
+        async_setup_component(hass, "homeassistant", {}),
+        async_setup_component(hass, "logbook", config),
+    )
+    await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
     hass.states.async_set(entity_id, None)
     hass.states.async_set(entity_id, 10)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
     entries = await _async_fetch_logbook(client)
 
@@ -1801,11 +2182,10 @@ async def test_empty_config(hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id)
 
 
-async def test_context_filter(hass, hass_client):
+async def test_context_filter(hass, hass_client, recorder_mock):
     """Test we can filter by context."""
-    await hass.async_add_executor_job(init_recorder_component, hass)
     assert await async_setup_component(hass, "logbook", {})
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
+    await async_recorder_block_till_done(hass)
 
     entity_id = "switch.blu"
     context = ha.Context()
@@ -1817,7 +2197,7 @@ async def test_context_filter(hass, hass_client):
     hass.states.async_set(entity_id, "off")
     hass.states.async_set(entity_id, "unknown", context=context)
 
-    await _async_commit_and_wait(hass)
+    await async_wait_recording_done(hass)
     client = await hass_client()
 
     # Test results
@@ -1831,7 +2211,7 @@ async def test_context_filter(hass, hass_client):
     response = await client.get(
         "/api/logbook", params={"context_id": context.id, "entity": entity_id}
     )
-    assert response.status == 400
+    assert response.status == HTTPStatus.BAD_REQUEST
 
 
 async def _async_fetch_logbook(client, params=None):
@@ -1847,70 +2227,206 @@ async def _async_fetch_logbook(client, params=None):
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}", params=params)
-    assert response.status == 200
+    assert response.status == HTTPStatus.OK
     return await response.json()
-
-
-async def _async_commit_and_wait(hass):
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(trigger_db_commit, hass)
-    await hass.async_block_till_done()
-    await hass.async_add_executor_job(hass.data[recorder.DATA_INSTANCE].block_till_done)
-    await hass.async_block_till_done()
 
 
 def _assert_entry(
     entry, when=None, name=None, message=None, domain=None, entity_id=None, state=None
 ):
     """Assert an entry is what is expected."""
-    if when:
+    if when is not None:
         assert when.isoformat() == entry["when"]
 
-    if name:
+    if name is not None:
         assert name == entry["name"]
 
-    if message:
+    if message is not None:
         assert message == entry["message"]
 
-    if domain:
+    if domain is not None:
         assert domain == entry["domain"]
 
-    if entity_id:
+    if entity_id is not None:
         assert entity_id == entry["entity_id"]
 
-    if state:
+    if state is not None:
         assert state == entry["state"]
 
 
-class MockLazyEventPartialState(ha.Event):
-    """Minimal mock of a Lazy event."""
+async def test_get_events(hass, hass_ws_client, recorder_mock):
+    """Test logbook get_events."""
+    now = dt_util.utcnow()
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, comp, {})
+            for comp in ("homeassistant", "logbook")
+        ]
+    )
+    await async_recorder_block_till_done(hass)
 
-    @property
-    def data_entity_id(self):
-        """Lookup entity id."""
-        return self.data.get(ATTR_ENTITY_ID)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
-    @property
-    def data_domain(self):
-        """Lookup domain."""
-        return self.data.get(ATTR_DOMAIN)
+    hass.states.async_set("light.kitchen", STATE_OFF)
+    await hass.async_block_till_done()
+    hass.states.async_set("light.kitchen", STATE_ON, {"brightness": 100})
+    await hass.async_block_till_done()
+    hass.states.async_set("light.kitchen", STATE_ON, {"brightness": 200})
+    await hass.async_block_till_done()
+    hass.states.async_set("light.kitchen", STATE_ON, {"brightness": 300})
+    await hass.async_block_till_done()
+    hass.states.async_set("light.kitchen", STATE_ON, {"brightness": 400})
+    await hass.async_block_till_done()
+    context = ha.Context(
+        id="ac5bd62de45711eaaeb351041eec8dd9",
+        user_id="b400facee45711eaa9308bfd3d19e474",
+    )
 
-    @property
-    def time_fired_minute(self):
-        """Minute the event was fired."""
-        return self.time_fired.minute
+    hass.states.async_set("light.kitchen", STATE_OFF, context=context)
+    await hass.async_block_till_done()
 
-    @property
-    def context_user_id(self):
-        """Context user id of event."""
-        return self.context.user_id
+    await async_wait_recording_done(hass)
 
-    @property
-    def context_id(self):
-        """Context id of event."""
-        return self.context.id
+    client = await hass_ws_client()
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "logbook/get_events",
+            "start_time": now.isoformat(),
+            "end_time": now.isoformat(),
+            "entity_ids": ["light.kitchen"],
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    assert response["result"] == []
 
-    @property
-    def time_fired_isoformat(self):
-        """Time event was fired in utc isoformat."""
-        return process_timestamp_to_utc_isoformat(self.time_fired)
+    await client.send_json(
+        {
+            "id": 2,
+            "type": "logbook/get_events",
+            "start_time": now.isoformat(),
+            "entity_ids": ["sensor.test"],
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    assert response["id"] == 2
+    assert response["result"] == []
+
+    await client.send_json(
+        {
+            "id": 3,
+            "type": "logbook/get_events",
+            "start_time": now.isoformat(),
+            "entity_ids": ["light.kitchen"],
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    assert response["id"] == 3
+
+    results = response["result"]
+    assert results[0]["entity_id"] == "light.kitchen"
+    assert results[0]["state"] == "on"
+    assert results[1]["entity_id"] == "light.kitchen"
+    assert results[1]["state"] == "off"
+
+    await client.send_json(
+        {
+            "id": 4,
+            "type": "logbook/get_events",
+            "start_time": now.isoformat(),
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    assert response["id"] == 4
+
+    results = response["result"]
+    assert len(results) == 3
+    assert results[0]["message"] == "started"
+    assert results[1]["entity_id"] == "light.kitchen"
+    assert results[1]["state"] == "on"
+    assert isinstance(results[1]["when"], float)
+    assert results[2]["entity_id"] == "light.kitchen"
+    assert results[2]["state"] == "off"
+    assert isinstance(results[2]["when"], float)
+
+    await client.send_json(
+        {
+            "id": 5,
+            "type": "logbook/get_events",
+            "start_time": now.isoformat(),
+            "context_id": "ac5bd62de45711eaaeb351041eec8dd9",
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    assert response["id"] == 5
+
+    results = response["result"]
+    assert len(results) == 1
+    assert results[0]["entity_id"] == "light.kitchen"
+    assert results[0]["state"] == "off"
+    assert isinstance(results[0]["when"], float)
+
+
+async def test_get_events_future_start_time(hass, hass_ws_client, recorder_mock):
+    """Test get_events with a future start time."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
+    future = dt_util.utcnow() + timedelta(hours=10)
+
+    client = await hass_ws_client()
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "logbook/get_events",
+            "start_time": future.isoformat(),
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    assert response["id"] == 1
+
+    results = response["result"]
+    assert len(results) == 0
+
+
+async def test_get_events_bad_start_time(hass, hass_ws_client, recorder_mock):
+    """Test get_events bad start time."""
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
+
+    client = await hass_ws_client()
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "logbook/get_events",
+            "start_time": "cats",
+        }
+    )
+    response = await client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "invalid_start_time"
+
+
+async def test_get_events_bad_end_time(hass, hass_ws_client, recorder_mock):
+    """Test get_events bad end time."""
+    now = dt_util.utcnow()
+    await async_setup_component(hass, "logbook", {})
+    await async_recorder_block_till_done(hass)
+
+    client = await hass_ws_client()
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "logbook/get_events",
+            "start_time": now.isoformat(),
+            "end_time": "dogs",
+        }
+    )
+    response = await client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "invalid_end_time"

@@ -1,7 +1,7 @@
 """Provide functionality to stream HLS."""
 from __future__ import annotations
 
-import logging
+from http import HTTPStatus
 from typing import TYPE_CHECKING, cast
 
 from aiohttp import web
@@ -18,13 +18,18 @@ from .const import (
     MAX_SEGMENTS,
     NUM_PLAYLIST_SEGMENTS,
 )
-from .core import PROVIDERS, IdleTimer, StreamOutput, StreamSettings, StreamView
+from .core import (
+    PROVIDERS,
+    IdleTimer,
+    Segment,
+    StreamOutput,
+    StreamSettings,
+    StreamView,
+)
 from .fmp4utils import get_codec_string
 
 if TYPE_CHECKING:
     from . import Stream
-
-_LOGGER = logging.getLogger(__name__)
 
 
 @callback
@@ -34,6 +39,7 @@ def async_setup_hls(hass: HomeAssistant) -> str:
     hass.http.register_view(HlsSegmentView())
     hass.http.register_view(HlsInitView())
     hass.http.register_view(HlsMasterPlaylistView())
+    hass.http.register_view(HlsPartView())
     return "/api/hls/{}/master_playlist.m3u8"
 
 
@@ -45,7 +51,7 @@ class HlsStreamOutput(StreamOutput):
         """Initialize HLS output."""
         super().__init__(hass, idle_timer, deque_maxlen=MAX_SEGMENTS)
         self.stream_settings: StreamSettings = hass.data[DOMAIN][ATTR_SETTINGS]
-        self._target_duration = 0.0
+        self._target_duration = self.stream_settings.min_segment_duration
 
     @property
     def name(self) -> str:
@@ -54,19 +60,32 @@ class HlsStreamOutput(StreamOutput):
 
     @property
     def target_duration(self) -> float:
-        """
-        Return the target duration.
-
-        The target duration is calculated as the max duration of any given segment,
-        and it is calculated only one time to avoid changing during playback.
-        """
-        if self._target_duration:
-            return self._target_duration
-        durations = [s.duration for s in self._segments if s.complete]
-        if len(durations) < 2:
-            return self.stream_settings.min_segment_duration
-        self._target_duration = max(durations)
+        """Return the target duration."""
         return self._target_duration
+
+    @callback
+    def _async_put(self, segment: Segment) -> None:
+        """Async put and also update the target duration.
+
+        The target duration is calculated as the max duration of any given segment.
+        Technically it should not change per the hls spec, but some cameras adjust
+        their GOPs periodically so we need to account for this change.
+        """
+        super()._async_put(segment)
+        self._target_duration = (
+            max((s.duration for s in self._segments), default=segment.duration)
+            or self.stream_settings.min_segment_duration
+        )
+
+    def discontinuity(self) -> None:
+        """Remove incomplete segment from deque."""
+        self._hass.loop.call_soon_threadsafe(self._async_discontinuity)
+
+    @callback
+    def _async_discontinuity(self) -> None:
+        """Remove incomplete segment from deque in event loop."""
+        if self._segments and not self._segments[-1].complete:
+            self._segments.pop()
 
 
 class HlsMasterPlaylistView(StreamView):
@@ -94,7 +113,7 @@ class HlsMasterPlaylistView(StreamView):
         return "\n".join(lines) + "\n"
 
     async def handle(
-        self, request: web.Request, stream: Stream, sequence: str
+        self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
         """Return m3u8 playlist."""
         track = stream.add_provider(HLS_PROVIDER)
@@ -195,7 +214,7 @@ class HlsPlaylistView(StreamView):
         """Return a HTTP Bad Request response."""
         return web.Response(
             body=None,
-            status=400,
+            status=HTTPStatus.BAD_REQUEST,
             # From Appendix B.1 of the RFC:
             # Successful responses to blocking Playlist requests should be cached
             # for six Target Durations. Unsuccessful responses (such as 404s) should
@@ -213,14 +232,14 @@ class HlsPlaylistView(StreamView):
         """Return a HTTP Not Found response."""
         return web.Response(
             body=None,
-            status=404,
+            status=HTTPStatus.NOT_FOUND,
             headers={
                 "Cache-Control": f"max-age={(4 if blocking else 1)*target_duration:.0f}"
             },
         )
 
     async def handle(
-        self, request: web.Request, stream: Stream, sequence: str
+        self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
         """Return m3u8 playlist."""
         track: HlsStreamOutput = cast(
@@ -263,7 +282,7 @@ class HlsPlaylistView(StreamView):
             (last_segment := track.last_segment)
             and hls_msn == last_segment.sequence
             and hls_part
-            >= len(last_segment.parts_by_byterange)
+            >= len(last_segment.parts)
             - 1
             + track.stream_settings.hls_advance_part_limit
         ):
@@ -273,7 +292,7 @@ class HlsPlaylistView(StreamView):
         while (
             (last_segment := track.last_segment)
             and hls_msn == last_segment.sequence
-            and hls_part >= len(last_segment.parts_by_byterange)
+            and hls_part >= len(last_segment.parts)
         ):
             if not await track.part_recv(
                 timeout=track.stream_settings.hls_part_timeout
@@ -287,8 +306,8 @@ class HlsPlaylistView(StreamView):
         # request as one for Part Index 0 of the following Parent Segment.
         if hls_msn + 1 == last_segment.sequence:
             if not (previous_segment := track.get_segment(hls_msn)) or (
-                hls_part >= len(previous_segment.parts_by_byterange)
-                and not last_segment.parts_by_byterange
+                hls_part >= len(previous_segment.parts)
+                and not last_segment.parts
                 and not await track.part_recv(
                     timeout=track.stream_settings.hls_part_timeout
                 )
@@ -314,7 +333,7 @@ class HlsInitView(StreamView):
     cors_allowed = True
 
     async def handle(
-        self, request: web.Request, stream: Stream, sequence: str
+        self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
         """Return init.mp4."""
         track = stream.add_provider(HLS_PROVIDER)
@@ -326,21 +345,17 @@ class HlsInitView(StreamView):
         )
 
 
-class HlsSegmentView(StreamView):
+class HlsPartView(StreamView):
     """Stream view to serve a HLS fmp4 segment."""
 
-    url = r"/api/hls/{token:[a-f0-9]+}/segment/{sequence:\d+}.m4s"
-    name = "api:stream:hls:segment"
+    url = r"/api/hls/{token:[a-f0-9]+}/segment/{sequence:\d+}.{part_num:\d+}.m4s"
+    name = "api:stream:hls:part"
     cors_allowed = True
 
     async def handle(
-        self, request: web.Request, stream: Stream, sequence: str
-    ) -> web.StreamResponse:
-        """Handle segments, part segments, and hinted segments.
-
-        For part and hinted segments, the start of the requested range must align
-        with a part boundary.
-        """
+        self, request: web.Request, stream: Stream, sequence: str, part_num: str
+    ) -> web.Response:
+        """Handle part."""
         track: HlsStreamOutput = cast(
             HlsStreamOutput, stream.add_provider(HLS_PROVIDER)
         )
@@ -357,80 +372,61 @@ class HlsSegmentView(StreamView):
         ):
             return web.Response(
                 body=None,
-                status=404,
+                status=HTTPStatus.NOT_FOUND,
                 headers={"Cache-Control": f"max-age={track.target_duration:.0f}"},
             )
-        # If the segment is ready or has been hinted, the http_range start should be at most
-        # equal to the end of the currently available data.
-        # If the segment is complete, the http_range start should be less than the end of the
-        # currently available data.
-        # If these conditions aren't met then we return a 416.
-        # http_range_start can be None, so use a copy that uses 0 instead of None
-        if (http_start := request.http_range.start or 0) > segment.data_size or (
-            segment.complete and http_start >= segment.data_size
-        ):
+        # If the part is ready or has been hinted,
+        if int(part_num) == len(segment.parts):
+            await track.part_recv(timeout=track.stream_settings.hls_part_timeout)
+        if int(part_num) >= len(segment.parts):
             return web.HTTPRequestRangeNotSatisfiable(
                 headers={
                     "Cache-Control": f"max-age={track.target_duration:.0f}",
-                    "Content-Range": f"bytes */{segment.data_size}",
                 }
             )
-        headers = {
-            "Content-Type": "video/iso.segment",
-            "Cache-Control": f"max-age={6*track.target_duration:.0f}",
-        }
-        # For most cases we have a 206 partial content response.
-        status = 206
-        # For the 206 responses we need to set a Content-Range header
-        # See https://datatracker.ietf.org/doc/html/rfc8673#section-2
-        if request.http_range.stop is None:
-            if request.http_range.start is None:
-                status = 200
-                if segment.complete:
-                    # This is a request for a full segment which is already complete
-                    # We should return a standard 200 response.
-                    return web.Response(
-                        body=segment.get_data(), headers=headers, status=status
-                    )
-                # Otherwise we still return a 200 response, but it is aggregating
-                http_stop = float("inf")
-            else:
-                # See https://datatracker.ietf.org/doc/html/rfc7233#section-2.1
-                headers[
-                    "Content-Range"
-                ] = f"bytes {http_start}-{(http_stop:=segment.data_size)-1}/*"
-        else:  # The remaining cases are all 206 responses
-            if segment.complete:
-                # If the segment is complete we have total size
-                headers["Content-Range"] = (
-                    f"bytes {http_start}-"
-                    + str(
-                        (http_stop := min(request.http_range.stop, segment.data_size))
-                        - 1
-                    )
-                    + f"/{segment.data_size}"
-                )
-            else:
-                # If we don't have the total size we use a *
-                headers[
-                    "Content-Range"
-                ] = f"bytes {http_start}-{(http_stop:=request.http_range.stop)-1}/*"
-        # Set up streaming response that we can write to as data becomes available
-        response = web.StreamResponse(headers=headers, status=status)
-        # Waiting until we write to prepare *might* give clients more accurate TTFB
-        # and ABR measurements, but it is probably not very useful for us since we
-        # only have one rendition anyway. Just prepare here for now.
-        await response.prepare(request)
-        try:
-            for bytes_to_write in segment.get_aggregating_bytes(
-                start_loc=http_start, end_loc=http_stop
-            ):
-                if bytes_to_write:
-                    await response.write(bytes_to_write)
-                elif not await track.part_recv(
-                    timeout=track.stream_settings.hls_part_timeout
-                ):
-                    break
-        except ConnectionResetError:
-            _LOGGER.warning("Connection reset while serving HLS partial segment")
-        return response
+        return web.Response(
+            body=segment.parts[int(part_num)].data,
+            headers={
+                "Content-Type": "video/iso.segment",
+                "Cache-Control": f"max-age={6*track.target_duration:.0f}",
+            },
+        )
+
+
+class HlsSegmentView(StreamView):
+    """Stream view to serve a HLS fmp4 segment."""
+
+    url = r"/api/hls/{token:[a-f0-9]+}/segment/{sequence:\d+}.m4s"
+    name = "api:stream:hls:segment"
+    cors_allowed = True
+
+    async def handle(
+        self, request: web.Request, stream: Stream, sequence: str, part_num: str
+    ) -> web.StreamResponse:
+        """Handle segments."""
+        track: HlsStreamOutput = cast(
+            HlsStreamOutput, stream.add_provider(HLS_PROVIDER)
+        )
+        track.idle_timer.awake()
+        # Ensure that we have a segment. If the request is from a hint for part 0
+        # of a segment, there is a small chance it may have arrived before the
+        # segment has been put. If this happens, wait for one part and retry.
+        if not (
+            (segment := track.get_segment(int(sequence)))
+            or (
+                await track.part_recv(timeout=track.stream_settings.hls_part_timeout)
+                and (segment := track.get_segment(int(sequence)))
+            )
+        ):
+            return web.Response(
+                body=None,
+                status=HTTPStatus.NOT_FOUND,
+                headers={"Cache-Control": f"max-age={track.target_duration:.0f}"},
+            )
+        return web.Response(
+            body=segment.get_data(),
+            headers={
+                "Content-Type": "video/iso.segment",
+                "Cache-Control": f"max-age={6*track.target_duration:.0f}",
+            },
+        )

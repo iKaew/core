@@ -10,9 +10,9 @@
         "step": {
             "user": {
                 "data": {
-                    "dsn": "DSN"
+                    "dsn": "Sentry DSN"
                 },
-                "description": "Add meg a Sentry DSN-t",
+                "description": "Adja meg a Sentry DSN-t",
                 "title": "Sentry"
             }
         }

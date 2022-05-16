@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Generator, Iterable
+from collections.abc import Iterable
 import datetime
-import itertools
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -20,9 +19,11 @@ from homeassistant.util.decorator import Registry
 from .const import ATTR_STREAMS, DOMAIN
 
 if TYPE_CHECKING:
+    from av import CodecContext, Packet
+
     from . import Stream
 
-PROVIDERS = Registry()
+PROVIDERS: Registry[str, type[StreamOutput]] = Registry()
 
 
 @attr.s(slots=True)
@@ -58,10 +59,7 @@ class Segment:
     start_time: datetime.datetime = attr.ib()
     _stream_outputs: Iterable[StreamOutput] = attr.ib()
     duration: float = attr.ib(default=0)
-    # Parts are stored in a dict indexed by byterange for easy lookup
-    # As of Python 3.7, insertion order is preserved, and we insert
-    # in sequential order, so the Parts are ordered
-    parts_by_byterange: dict[int, Part] = attr.ib(factory=dict)
+    parts: list[Part] = attr.ib(factory=list)
     # Store text of this segment's hls playlist for reuse
     # Use list[str] for easy appends
     hls_playlist_template: list[str] = attr.ib(factory=list)
@@ -89,13 +87,7 @@ class Segment:
     @property
     def data_size(self) -> int:
         """Return the size of all part data without init in bytes."""
-        # We can use the last part to quickly calculate the total data size.
-        if not self.parts_by_byterange:
-            return 0
-        last_http_range_start, last_part = next(
-            reversed(self.parts_by_byterange.items())
-        )
-        return last_http_range_start + len(last_part.data)
+        return sum(len(part.data) for part in self.parts)
 
     @callback
     def async_add_part(
@@ -107,36 +99,14 @@ class Segment:
 
         Duration is non zero only for the last part.
         """
-        self.parts_by_byterange[self.data_size] = part
+        self.parts.append(part)
         self.duration = duration
         for output in self._stream_outputs:
             output.part_put()
 
     def get_data(self) -> bytes:
         """Return reconstructed data for all parts as bytes, without init."""
-        return b"".join([part.data for part in self.parts_by_byterange.values()])
-
-    def get_aggregating_bytes(
-        self, start_loc: int, end_loc: int | float
-    ) -> Generator[bytes, None, None]:
-        """Yield available remaining data until segment is complete or end_loc is reached.
-
-        Begin at start_loc. End at end_loc (exclusive).
-        Used to help serve a range request on a segment.
-        """
-        pos = start_loc
-        while (part := self.parts_by_byterange.get(pos)) or not self.complete:
-            if not part:
-                yield b""
-                continue
-            pos += len(part.data)
-            # Check stopping condition and trim output if necessary
-            if pos >= end_loc:
-                assert isinstance(end_loc, int)
-                # Trimming is probably not necessary, but it doesn't hurt
-                yield part.data[: len(part.data) + end_loc - pos]
-                return
-            yield part.data
+        return b"".join([part.data for part in self.parts])
 
     def _render_hls_template(self, last_stream_id: int, render_parts: bool) -> str:
         """Render the HLS playlist section for the Segment.
@@ -151,15 +121,12 @@ class Segment:
             # This is a placeholder where the rendered parts will be inserted
             self.hls_playlist_template.append("{}")
         if render_parts:
-            for http_range_start, part in itertools.islice(
-                self.parts_by_byterange.items(),
-                self.hls_num_parts_rendered,
-                None,
+            for part_num, part in enumerate(
+                self.parts[self.hls_num_parts_rendered :], self.hls_num_parts_rendered
             ):
                 self.hls_playlist_parts.append(
                     f"#EXT-X-PART:DURATION={part.duration:.3f},URI="
-                    f'"./segment/{self.sequence}.m4s",BYTERANGE="{len(part.data)}'
-                    f'@{http_range_start}"{",INDEPENDENT=YES" if part.has_keyframe else ""}'
+                    f'"./segment/{self.sequence}.{part_num}.m4s"{",INDEPENDENT=YES" if part.has_keyframe else ""}'
                 )
         if self.complete:
             # Construct the final playlist_template. The placeholder will share a line with
@@ -187,7 +154,7 @@ class Segment:
         self.hls_playlist_template = ["\n".join(self.hls_playlist_template)]
         # lstrip discards extra preceding newline in case first render was empty
         self.hls_playlist_parts = ["\n".join(self.hls_playlist_parts).lstrip()]
-        self.hls_num_parts_rendered = len(self.parts_by_byterange)
+        self.hls_num_parts_rendered = len(self.parts)
         self.hls_playlist_complete = self.complete
 
         return self.hls_playlist_template[0]
@@ -205,14 +172,15 @@ class Segment:
         # Preload hints help save round trips by informing the client about the next part.
         # The next part will usually be in this segment but will be first part of the next
         # segment if this segment is already complete.
-        # pylint: disable=undefined-loop-variable
         if self.complete:  # Next part belongs to next segment
             sequence = self.sequence + 1
-            start = 0
+            part_num = 0
         else:  # Next part is in the same segment
             sequence = self.sequence
-            start = self.data_size
-        hint = f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI="./segment/{sequence}.m4s",BYTERANGE-START={start}'
+            part_num = len(self.parts)
+        hint = (
+            f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI="./segment/{sequence}.{part_num}.m4s"'
+        )
         return (playlist + "\n" + hint) if playlist else hint
 
 
@@ -367,7 +335,7 @@ class StreamView(HomeAssistantView):
     platform = None
 
     async def get(
-        self, request: web.Request, token: str, sequence: str = ""
+        self, request: web.Request, token: str, sequence: str = "", part_num: str = ""
     ) -> web.StreamResponse:
         """Start a GET request."""
         hass = request.app["hass"]
@@ -383,10 +351,93 @@ class StreamView(HomeAssistantView):
         # Start worker if not already started
         stream.start()
 
-        return await self.handle(request, stream, sequence)
+        return await self.handle(request, stream, sequence, part_num)
 
     async def handle(
-        self, request: web.Request, stream: Stream, sequence: str
+        self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.StreamResponse:
         """Handle the stream request."""
         raise NotImplementedError()
+
+
+class KeyFrameConverter:
+    """
+    Enables generating and getting an image from the last keyframe seen in the stream.
+
+    An overview of the thread and state interaction:
+        the worker thread sets a packet
+        get_image is called from the main asyncio loop
+        get_image schedules _generate_image in an executor thread
+        _generate_image will try to create an image from the packet
+        _generate_image will clear the packet, so there will only be one attempt per packet
+    If successful, self._image will be updated and returned by get_image
+    If unsuccessful, get_image will return the previous image
+    """
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize."""
+
+        # Keep import here so that we can import stream integration without installing reqs
+        # pylint: disable=import-outside-toplevel
+        from homeassistant.components.camera.img_util import TurboJPEGSingleton
+
+        self.packet: Packet = None
+        self._hass = hass
+        self._image: bytes | None = None
+        self._turbojpeg = TurboJPEGSingleton.instance()
+        self._lock = asyncio.Lock()
+        self._codec_context: CodecContext | None = None
+
+    def create_codec_context(self, codec_context: CodecContext) -> None:
+        """
+        Create a codec context to be used for decoding the keyframes.
+
+        This is run by the worker thread and will only be called once per worker.
+        """
+
+        # Keep import here so that we can import stream integration without installing reqs
+        # pylint: disable=import-outside-toplevel
+        from av import CodecContext
+
+        self._codec_context = CodecContext.create(codec_context.name, "r")
+        self._codec_context.extradata = codec_context.extradata
+        self._codec_context.skip_frame = "NONKEY"
+        self._codec_context.thread_type = "NONE"
+
+    def _generate_image(self, width: int | None, height: int | None) -> None:
+        """
+        Generate the keyframe image.
+
+        This is run in an executor thread, but since it is called within an
+        the asyncio lock from the main thread, there will only be one entry
+        at a time per instance.
+        """
+
+        if not (self._turbojpeg and self.packet and self._codec_context):
+            return
+        packet = self.packet
+        self.packet = None
+        # decode packet (flush afterwards)
+        frames = self._codec_context.decode(packet)
+        for _i in range(2):
+            if frames:
+                break
+            frames = self._codec_context.decode(None)
+        if frames:
+            frame = frames[0]
+            if width and height:
+                frame = frame.reformat(width=width, height=height)
+            bgr_array = frame.to_ndarray(format="bgr24")
+            self._image = bytes(self._turbojpeg.encode(bgr_array))
+
+    async def async_get_image(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> bytes | None:
+        """Fetch an image from the Stream and return it as a jpeg in bytes."""
+
+        # Use a lock to ensure only one thread is working on the keyframe at a time
+        async with self._lock:
+            await self._hass.async_add_executor_job(self._generate_image, width, height)
+        return self._image

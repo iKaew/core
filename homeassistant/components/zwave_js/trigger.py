@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 from types import ModuleType
-from typing import Any, Callable, cast
+from typing import cast
 
+from homeassistant.components.automation import (
+    AutomationActionType,
+    AutomationTriggerInfo,
+)
 from homeassistant.const import CONF_PLATFORM
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 
-from .triggers import value_updated
+from .triggers import event, value_updated
 
 TRIGGERS = {
     "value_updated": value_updated,
+    "event": event,
 }
 
 
@@ -40,14 +45,14 @@ async def async_validate_trigger_config(
 async def async_attach_trigger(
     hass: HomeAssistant,
     config: ConfigType,
-    action: Callable,
-    automation_info: dict[str, Any],
-) -> Callable:
+    action: AutomationActionType,
+    automation_info: AutomationTriggerInfo,
+) -> CALLBACK_TYPE:
     """Attach trigger of specified platform."""
     platform = _get_trigger_platform(config)
     assert hasattr(platform, "async_attach_trigger")
     return cast(
-        Callable,
+        CALLBACK_TYPE,
         await getattr(platform, "async_attach_trigger")(
             hass, config, action, automation_info
         ),
